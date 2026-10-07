@@ -21,6 +21,8 @@ local MAX_ATTEMPTS = 4        -- tries per button before skipping it
 local COLLECT_WAIT = 1.5      -- seconds spent standing on the collector
 local CHECK_WAIT = 0.7        -- seconds to wait after TPing to a button before checking money
 local MAX_REBIRTH = 12        -- the player can never enter more than this
+local REBIRTH_CONFIRM_MIN_CASH = 500000 -- screenshot rebirth confirmation cost; the dialog cost is also read dynamically
+local REBIRTH_CONFIRM_TIMEOUT = 8 -- seconds to wait for the confirmation dialog
 local REBIRTH_SKIP_TIME = 30  -- if a rebirth button does not work, wait this many seconds before trying it again
 
 local function dbg(...)
@@ -153,6 +155,8 @@ completionFillCorner.Parent = completionBarFill
 local completionPercent = nil
 local completionEArmed = true
 local completionEPressing = false
+local completionEStatus = nil
+local completionRequiredCash = REBIRTH_CONFIRM_MIN_CASH
 
 local function setCompletionDisplay(percent)
 	completionPercent = percent
@@ -164,7 +168,7 @@ local function setCompletionDisplay(percent)
 
 	local clampedPercent = math.clamp(percent, 0, 100)
 	if completionEPressing then
-		completionLabel.Text = ("Completion: %g%% | Holding E"):format(clampedPercent)
+		completionLabel.Text = ("Completion: %g%% | %s"):format(clampedPercent, completionEStatus or "Rebirth pending")
 	else
 		completionLabel.Text = ("Completion: %g%%"):format(clampedPercent)
 	end
@@ -651,7 +655,7 @@ local VirtualInputManager = game:GetService("VirtualInputManager")
 local RunService = game:GetService("RunService")
 local HOLD_TIME = 3          -- seconds to hold E
 local SEARCH_TIMEOUT = 10    -- seconds to keep searching for the barrel / airdrop
-local FLY_SPEED = 50       -- FIX: was 100. Slower = the game is less likely to reset you (and the barrel)
+local FLY_SPEED = 40         -- FIX: was 100. Slower = the game is less likely to reset you (and the barrel)
 local RECENT_WINDOW = 90     -- an object counts as "new" if it appeared in the last 90 s
 local airdropPending = false
 local handlingAirdrop = false
@@ -663,7 +667,7 @@ local SCAN_CHUNK = 1500        -- objects checked before pausing one frame (keep
 local AIRDROP_COOLDOWN = 20    -- seconds to wait after a finished run before another auto trigger
 
 local function triggerAirdrop(reason, ignoreCooldown)
-	if not running or airdropPending or handlingAirdrop then return end
+	if not running or airdropPending or handlingAirdrop or completionEPressing then return end
 	if not ignoreCooldown and os.clock() - lastAirdropEnd < AIRDROP_COOLDOWN then return end
 	airdropPending = true
 	setStatus("Airdrop found (" .. reason .. ")")
@@ -709,7 +713,7 @@ end
 task.spawn(function()
 	while env.AutoBuyerRunId == myRunId do
 		task.wait(SCAN_INTERVAL)
-		if running and not airdropPending and not handlingAirdrop
+		if running and not airdropPending and not handlingAirdrop and not completionEPressing
 			and os.clock() - lastAirdropEnd >= AIRDROP_COOLDOWN then
 			local ok, found = pcall(realTargetExists)
 			if ok and found then triggerAirdrop("auto scan") end
@@ -1102,6 +1106,7 @@ end
 --   1) a non-price floating/surface label containing both "oil" and "exchange"
 --   2) a non-purchase hold-E prompt containing "exchange" (some prompts omit "oil")
 --   3) a part / model with "exchange" in its name (purchase buttons are filtered)
+--   4) if no exchanger candidate exists, the floating "Resource Collection ... studs" UI
 -- Best pick: has an E prompt > is in your tycoon > is not a buy pad > closest to you.
 local function findExchange(refPos)
 	local cands, seen = {}, {}
@@ -1216,7 +1221,60 @@ local function findExchange(refPos)
 		if x.buyPad ~= y.buyPad then return not x.buyPad end
 		return x.dist < y.dist
 	end)
-	return good[1]
+	if good[1] then return good[1] end
+
+	-- Fallback: if no physical Oil Exchange candidate is available, use the
+	-- floating "Resource Collection ... studs" marker shown in the reference image.
+	local fallback, fallbackDistance
+	local fallbackSeen = {}
+	local function scanResourceCollection(root)
+		local list = root:GetDescendants()
+		for i, obj in ipairs(list) do
+			if (obj:IsA("BillboardGui") or obj:IsA("SurfaceGui"))
+				and obj.Enabled and not obj:IsDescendantOf(screenGui) then
+				local text = ""
+				for _, label in ipairs(obj:GetDescendants()) do
+					if (label:IsA("TextLabel") or label:IsA("TextButton"))
+						and labelVisible(label, obj) then
+						local raw = label.ContentText
+						if not raw or raw == "" then raw = label.Text end
+						text = text .. raw .. " "
+					end
+				end
+				local lower = string.lower((string.gsub(text, "\n", " ")))
+				if string.find(lower, "resource collection", 1, true)
+					and string.find(lower, "studs", 1, true) then
+					local part = resolveGuiPart(obj)
+					if part and not fallbackSeen[part] then
+						fallbackSeen[part] = true
+						local labelDistance = parseStuds(lower)
+						-- Anchor fallback ranking to the remembered Cash Collector, not the
+						-- changing distance printed in the floating UI.
+						local collectionOrigin = lastCollectorPos or refPos
+						local worldDistance = (part.Position - collectionOrigin).Magnitude
+						local sortDistance = worldDistance
+						if not fallbackDistance or sortDistance < fallbackDistance then
+							fallbackDistance = sortDistance
+							fallback = {
+								part = part,
+								prompt = findPromptFor(part),
+								owned = belongsToMe(part),
+								buyPad = false,
+							dist = worldDistance,
+								labelDist = labelDistance,
+								resourceFallback = true,
+							}
+						end
+					end
+				end
+			end
+			if i % 2000 == 0 then task.wait() end
+		end
+	end
+
+	scanResourceCollection(workspace)
+	scanResourceCollection(playerGui)
+	return fallback
 end
 
 -- true if we picked a barrel up earlier, it still exists, but it is lying far away from us (dropped)
@@ -1318,10 +1376,15 @@ local function visitExchange()
 	until cand or os.clock() > deadline or not running
 
 	if not cand then
-		dbg("Oil Exchange NOT FOUND")
-		setStatus("Oil Exchange not found!")
+		dbg("Oil Exchange and Resource Collection fallback NOT FOUND")
+		setStatus("Oil Exchange / Resource Collection not found!")
 		task.wait(3)
 		return
+	end
+
+	local exchangeTargetName = cand.resourceFallback and "Resource Collection" or "Oil Exchange"
+	if cand.resourceFallback then
+		dbg("Oil Exchange not found; using Resource Collection UI fallback:", cand.part:GetFullName())
 	end
 
 	local function goal()
@@ -1331,7 +1394,7 @@ local function visitExchange()
 	end
 
 	pcall(function() player:RequestStreamAroundAsync(goal().Position) end)
-	setStatus("Flying to Oil Exchange")
+	setStatus("Flying to " .. exchangeTargetName)
 	if not flyTo(goal(), "Exchange") then return end
 	if not running then return end
 
@@ -1344,7 +1407,7 @@ local function visitExchange()
 	end
 	task.wait(1)
 
-	setStatus("Holding E (Exchange)")
+	setStatus("Holding E (" .. exchangeTargetName .. ")")
 	holdE(HOLD_TIME, (cand.prompt and cand.prompt.Parent) and cand.prompt or nil)
 	task.wait(1)
 	if isBarrelCarried() then
@@ -1668,7 +1731,7 @@ end
 -- tries to buy one rebirth button (just stand on it, no money check)
 local function buyRebirth(entry)
 	for attempt = 1, MAX_ATTEMPTS do
-		if not (running and env.AutoBuyerRunId == myRunId) or airdropPending then return end
+		if not (running and env.AutoBuyerRunId == myRunId) or airdropPending or completionEPressing then return end
 		if not isAlive(entry) then
 			rebirthDone[entry.key] = true
 			return
@@ -1720,7 +1783,7 @@ local function doRebirthButtons()
 	table.sort(list, function(a, b) return a.num < b.num end)
 
 	for _, entry in ipairs(list) do
-		if not (running and env.AutoBuyerRunId == myRunId) or airdropPending
+		if not (running and env.AutoBuyerRunId == myRunId) or airdropPending or completionEPressing
 			or barrelRecoveryPending or trackedBarrel or isBarrelCarried() then return end
 
 		if entry.farPos then
@@ -1777,6 +1840,12 @@ end
 
 local function mainLoop()
 	while stillRunning() do
+		-- Pause movement and purchases while the completion rebirth dialog is being confirmed.
+		if completionEPressing then
+			task.wait(0.1)
+			continue
+		end
+
 		-- Death while carrying is handled before any airdrop, rebirth, collector, or button trip.
 		if barrelRecoveryPending then
 			if not recoverDroppedBarrelFromUI() then
@@ -1815,7 +1884,7 @@ local function mainLoop()
 		-- 0. rebirth buttons FIRST (no money check)
 		doRebirthButtons()
 		if not stillRunning() then break end
-		if airdropPending then continue end
+		if completionEPressing or airdropPending then continue end
 
 		setStatus("Scanning...")
 		local collector, buttons = scan()
@@ -1831,7 +1900,7 @@ local function mainLoop()
 		teleportTo(collector.part, true)
 		task.wait(COLLECT_WAIT)
 		if not stillRunning() then break end
-		if airdropPending then continue end
+		if completionEPressing or airdropPending then continue end
 
 		-- 2. check money
 		local money = getMoney()
@@ -1860,7 +1929,7 @@ local function mainLoop()
 
 		-- 4. visit each affordable button
 		for _, btn in ipairs(affordable) do
-			if not stillRunning() or airdropPending then break end
+			if not stillRunning() or airdropPending or completionEPressing then break end
 
 			local current = getMoney() or money
 			if btn.price > current then
@@ -1869,7 +1938,7 @@ local function mainLoop()
 
 			local bought = false
 			for attempt = 1, MAX_ATTEMPTS do
-				if not stillRunning() or airdropPending then break end
+				if not stillRunning() or airdropPending or completionEPressing then break end
 				if not isAlive(btn) then bought = true break end
 
 				setStatus(("Buying (%d/%d): %s"):format(attempt, MAX_ATTEMPTS, string.sub(btn.text, 1, 24)))
@@ -1905,7 +1974,7 @@ local function releaseMouse()
 	pcall(function() VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 0) end)
 end
 
--- Increase the user's rebirth target by one after the completion E hold.
+-- Increase the user's rebirth target only after the Rebirth confirmation dialog closes.
 -- Keep 0 = off, and respect the configured maximum.
 local function incrementRebirthLimit()
 	local entered = tonumber(string.match(rebirthBox.Text, "%d+"))
@@ -1924,11 +1993,102 @@ local function incrementRebirthLimit()
 	end
 end
 
--- Press E for exactly two seconds once when completion reaches 100%.
--- The AutoBuyer toggle must be ON; E is released even if an input call fails.
+local function visibleGuiText(root)
+	local pieces = {}
+	local function appendText(obj)
+		if isCompletionTextObject(obj) and labelVisible(obj, playerGui) then
+			local text = getCompletionText(obj)
+			if text ~= "" then table.insert(pieces, text) end
+		end
+	end
+
+	if isCompletionTextObject(root) then appendText(root) end
+	for _, child in ipairs(root:GetDescendants()) do appendText(child) end
+	return table.concat(pieces, " ")
+end
+
+local function parseRebirthCost(text)
+	local lower = string.lower(text or "")
+	local amount, suffix = string.match(lower, "cost%s*:%s*%$?%s*([%d%.,]+)%s*([kmbt]?)")
+	if not amount then return nil end
+	amount = string.gsub(amount, ",", "")
+	local value = tonumber(amount)
+	if not value then return nil end
+	return value * (SUFFIX[suffix] or 1)
+end
+
+local function normalizedButtonText(button)
+	local text = string.lower(getCompletionText(button))
+	local trimmed = string.gsub(text, "^%s*(.-)%s*$", "%1")
+	return trimmed
+end
+
+local function findDialogButton(scope, wantedText)
+	if not scope then return nil end
+	for _, obj in ipairs(scope:GetDescendants()) do
+		if obj:IsA("TextButton") and labelVisible(obj, playerGui)
+			and normalizedButtonText(obj) == string.lower(wantedText) then
+			return obj
+		end
+	end
+	return nil
+end
+
+local function findRebirthConfirmation()
+	for _, obj in ipairs(playerGui:GetDescendants()) do
+		if obj:IsA("TextButton") and labelVisible(obj, playerGui)
+			and normalizedButtonText(obj) == "confirm" then
+			local scope = obj.Parent
+			while scope and scope ~= playerGui do
+				local text = visibleGuiText(scope)
+				local lower = string.lower(text)
+				local cost = parseRebirthCost(text)
+				if cost and string.find(lower, "rebirth", 1, true) then
+					return obj, cost, scope
+				end
+				scope = scope.Parent
+			end
+		end
+	end
+	return nil, nil, nil
+end
+
+local function waitForRebirthConfirmation(timeout)
+	local deadline = os.clock() + timeout
+	repeat
+		local button, cost, scope = findRebirthConfirmation()
+		if button then return button, cost, scope end
+		task.wait(0.2)
+	until os.clock() >= deadline
+	return nil, nil, nil
+end
+
+local function clickGuiButton(button)
+	if not (button and button.Parent and labelVisible(button, playerGui)) then return false end
+	local center = button.AbsolutePosition + button.AbsoluteSize / 2
+	local downWorked = pcall(function()
+		VirtualInputManager:SendMouseButtonEvent(center.X, center.Y, 0, true, game, 0)
+	end)
+	if downWorked then
+		task.wait(0.08)
+		pcall(function()
+			VirtualInputManager:SendMouseButtonEvent(center.X, center.Y, 0, false, game, 0)
+		end)
+		return true
+	end
+	return pcall(function() button:Activate() end)
+end
+
+local function finishCompletionAction()
+	completionEPressing = false
+	completionEStatus = nil
+	if completionPercent ~= nil then setCompletionDisplay(completionPercent) end
+end
+
 local function pressCompletionE()
 	if completionEPressing then return end
 	completionEPressing = true
+	completionEStatus = "Holding E"
 	setCompletionDisplay(completionPercent or 100)
 
 	pcall(function()
@@ -1943,13 +2103,67 @@ local function pressCompletionE()
 	end)
 	if keyrelease then pcall(keyrelease, 0x45) end
 
-	-- Once E has been released, advance the entered rebirth target by one.
-	incrementRebirthLimit()
-
-	completionEPressing = false
-	if completionPercent ~= nil then
-		setCompletionDisplay(completionPercent)
+	completionEStatus = "Waiting for confirmation"
+	setCompletionDisplay(completionPercent or 100)
+	local confirmButton, cost, dialog = waitForRebirthConfirmation(REBIRTH_CONFIRM_TIMEOUT)
+	if not confirmButton then
+		setStatus("Rebirth confirmation not found; target unchanged")
+		finishCompletionAction()
+		return
 	end
+
+	completionRequiredCash = math.max(REBIRTH_CONFIRM_MIN_CASH, cost)
+	local cash = getMoney()
+	if not cash or cash < cost then
+		local cancelButton = findDialogButton(dialog, "cancel")
+		local cancelled = cancelButton and clickGuiButton(cancelButton)
+		setStatus(("Need $%s cash to confirm rebirth"):format(tostring(cost)))
+		completionEArmed = cancelled == true
+		finishCompletionAction()
+		return
+	end
+
+	if not running or env.AutoBuyerRunId ~= myRunId then
+		local cancelButton = findDialogButton(dialog, "cancel")
+		if cancelButton then clickGuiButton(cancelButton) end
+		setStatus("Auto Buyer stopped; rebirth not confirmed")
+		finishCompletionAction()
+		return
+	end
+
+	completionEStatus = "Confirming rebirth"
+	setCompletionDisplay(completionPercent or 100)
+	setStatus(("Confirming rebirth ($%s)"):format(tostring(cost)))
+	if not clickGuiButton(confirmButton) then
+		setStatus("Could not click Rebirth Confirm; target unchanged")
+		finishCompletionAction()
+		return
+	end
+
+	local confirmed = false
+	local closeDeadline = os.clock() + REBIRTH_CONFIRM_TIMEOUT
+	repeat
+		task.wait(0.2)
+		local stillOpen = findRebirthConfirmation()
+		if not stillOpen then
+			confirmed = true
+			break
+		end
+	until os.clock() >= closeDeadline
+
+	if confirmed then
+		task.wait(0.4)
+		local oldLimit = rebirthLimit
+		incrementRebirthLimit()
+		if rebirthLimit > oldLimit then
+			setStatus("Rebirth confirmed; target advanced to " .. tostring(rebirthLimit))
+		else
+			setStatus("Rebirth confirmed; target is OFF or already at maximum")
+		end
+	else
+		setStatus("Rebirth confirmation stayed open; target unchanged")
+	end
+	finishCompletionAction()
 end
 
 -- Keep the local completion display updated, even while AutoBuyer is OFF.
@@ -1963,11 +2177,17 @@ task.spawn(function()
 		if percent ~= nil then
 			if percent < 100 then
 				completionEArmed = true
-			elseif completionEArmed and running and not airdropPending
+			elseif completionEArmed and not completionEPressing and running and not airdropPending
 				and not handlingAirdrop and not barrelRecoveryPending
 				and not isBarrelCarried() then
-				completionEArmed = false
-				task.spawn(pressCompletionE)
+				local cash = getMoney()
+				if cash and cash >= completionRequiredCash then
+					completionEArmed = false
+					task.spawn(pressCompletionE)
+				else
+					completionLabel.Text = ("Completion: %g%% | Need $%s"):format(
+						math.clamp(percent, 0, 100), tostring(completionRequiredCash))
+				end
 			end
 		end
 
