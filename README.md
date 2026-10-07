@@ -91,13 +91,17 @@ Eligible targets are ordered from the smallest rebirth number upward. The script
 
 A local reader scans text objects in `PlayerGui` for completion information. It can parse a percentage in the same label as the word “Completion,” combine text from a shared interface container, or use a nearby percentage label in the same UI layer as a fallback. The HUD refreshes approximately twice per second.
 
-When completion reaches **100%**, the script arms one action for that completion cycle. It waits until Auto Buyer is ON and the airdrop, recovery, and barrel-delivery routines are idle, then:
+When completion reaches **100%**, the script arms one action for that completion cycle. It waits until Auto Buyer is ON, the airdrop/recovery/barrel routines are idle, and the readable cash balance is at least **$500,000** (the cost shown in the supplied confirmation screenshot). While cash is below the requirement, it waits and continues displaying the amount needed.
 
-1. Holds `E` for **two seconds**.
-2. Releases `E`.
-3. Increases a positive rebirth target by one, without exceeding `12`.
+The confirmation sequence is:
 
-If the rebirth field is empty or set to `0`, it remains disabled. The completion action rearms after the observed percentage falls below 100%.
+1. Hold `E` for **two seconds**, then release it.
+2. Find a visible confirmation dialog containing **Rebirth** and a readable `Cost:` amount (for example, `500k`).
+3. Re-check the player's cash against that displayed cost. If the balance is insufficient, the script uses **Cancel** when available and waits for the required balance instead of confirming early.
+4. Click **Confirm** only when the cash requirement is met.
+5. Wait for the confirmation dialog to close; only then increase a positive rebirth target by one, capped at `12`.
+
+If the dialog or its cost cannot be identified, or the dialog does not close after the click, the target is not incremented. An empty rebirth field or `0` remains disabled. The completion action rearms after the observed percentage falls below 100%; a cancelled insufficient-funds attempt can re-arm once the required cash is available.
 
 ### 5. Oil barrel and airdrop detection
 
@@ -113,7 +117,9 @@ When a barrel is pending, the script first returns by flight to the remembered C
 
 The exchanger finder uses several clues: non-price labels containing “oil” and “exchange,” prompts containing “exchange,” and parts/models named with “exchange.” The screenshot label **`$100,000 PARTS $100,000 OIL EXCHANGE`** is treated as a price-bearing purchase pad—not as the physical exchanger. Purchase cues and price-bearing labels are filtered so the script does not deliberately select that sign as the exchange destination.
 
-The finder is dependent on the exchanger being present, streamed, and recognizable in the current game hierarchy. If it has not been purchased/unlocked or the game changes its labels/prompts, the script may report **Oil Exchange not found**.
+If no usable Oil Exchange candidate is found, the script searches for the floating **Resource Collection … studs** marker shown in the reference image. It ranks matching markers by their 3D distance from the remembered Cash Collector location—not by the changing number in the UI—then flies to the nearest one and performs the same hold-`E` interaction as the normal exchange route. The HUD identifies this as the **Resource Collection** fallback.
+
+The finder is dependent on the exchanger or fallback marker being present, streamed, and recognizable in the current game hierarchy. If neither appears—or the fallback marker is not the correct deposit point—the script may still report **Oil Exchange / Resource Collection not found** or the barrel may remain carried after the interaction.
 
 ### 7. Death and dropped-barrel recovery
 
@@ -134,6 +140,8 @@ The script intentionally does **not** move equipped `Tool` objects into the Back
 | Setting | Default | Meaning |
 |:--|:--:|:--|
 | `MAX_REBIRTH` | `12` | Maximum rebirth target accepted by the HUD. |
+| `REBIRTH_CONFIRM_MIN_CASH` | `500000` | Minimum cash required before the 100%-completion E action starts; the dialog's displayed cost is also checked. |
+| `REBIRTH_CONFIRM_TIMEOUT` | `8` seconds | Time allowed for the confirmation dialog to appear or close. |
 | `FLY_SPEED` | `50` | Flight speed cap; the mover slows as it approaches its destination. |
 | `HOLD_TIME` | `3` seconds | Default hold duration for barrel/airdrop/exchange interactions; a prompt with a longer hold requirement can extend it. |
 | `MAX_ATTEMPTS` | `4` | Maximum attempts per purchase/rebirth button before continuing; failed rebirths are temporarily skipped before retrying. |
@@ -152,9 +160,11 @@ Values are defined near the top of the script or in the airdrop settings section
 |:--|:--|
 | **No “Cash to collect” found** | Make sure the base is loaded and the collector label is visible. The scanner relies on visible in-game GUI text and ownership clues. |
 | **Can't read money** | Check that cash appears in `leaderstats` or as a visible dollar-formatted HUD label. |
-| **Oil Exchange not found** | Confirm the exchanger is purchased/unlocked and present in the base. Let the base stream in near the remembered Cash Collector; check that an exchanger prompt, name, or non-price label is visible. |
+| **Oil Exchange not found** | The script also falls back to the nearest visible `Resource Collection … studs` marker. Confirm the exchanger or fallback marker is streamed in and has a usable interaction point; if the barrel remains carried, the chosen marker may not be the oil deposit. |
 | **Dropped barrel is not recovered** | Wait for the floating Oil distance label to appear after respawn. Recovery uses that label to find the barrel again. |
 | **Completion stays at `--%`** | Ensure the game's completion text is visible in the local player interface. The reader searches `PlayerGui`; a server-only value or differently worded display may not be detected. |
+| **100% action waits instead of pressing E** | Ensure Auto Buyer is ON, delivery/airdrop handling is idle, and the money reader can confirm at least `$500,000`. |
+| **Rebirth confirmation is not clicked** | The script requires a visible **Rebirth** dialog with a parseable `Cost:` label and at least that much cash. If the dialog wording or button differs, it will leave the target unchanged. |
 | **Controls do not respond** | Confirm the Auto Buyer toggle is ON for automated actions and that the execution environment supports the client APIs used by the script. |
 
 ---
