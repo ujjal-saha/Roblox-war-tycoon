@@ -24,6 +24,7 @@ local MAX_REBIRTH = 12        -- the player can never enter more than this
 local REBIRTH_CONFIRM_MIN_CASH = 500000 -- screenshot rebirth confirmation cost; the dialog cost is also read dynamically
 local REBIRTH_CONFIRM_TIMEOUT = 8 -- seconds to wait for the confirmation dialog
 local REBIRTH_SKIP_TIME = 30  -- if a rebirth button does not work, wait this many seconds before trying it again
+local DESPAWN_MIN_SECONDS = 100 -- a fallen barrel shows "DESPAWN: ~600"; other loot shows "DESPAWN: 30" and is ignored
 
 local function dbg(...)
 	if DEBUG then warn("[AutoBuyer]", ...) end
@@ -408,7 +409,7 @@ local function isBarrelCarried()
 end
 
 -- Remember a carried/tracked barrel if the character dies. After respawn, the
--- main loop will locate its dropped "Oil ... studs" label and recover it.
+-- main loop will locate the dropped barrel from its floating "DESPAWN: ..." label and recover it.
 local function watchCharacterForBarrelDeath(character)
 	task.spawn(function()
 		local humanoid = character:FindFirstChildOfClass("Humanoid") or character:WaitForChild("Humanoid", 10)
@@ -425,8 +426,8 @@ local function watchCharacterForBarrelDeath(character)
 					pcall(function() barrelRecoveryTargetPos = barrelRecoveryTargetPart.Position end)
 				end
 				trackedBarrel = nil
-				setStatus("Died with barrel; scanning for dropped Oil UI...")
-				dbg("Character died with a barrel pending; will search floating Oil labels")
+				setStatus("Died with barrel; scanning for the fallen barrel (DESPAWN label)...")
+				dbg("Character died with a barrel pending; will search DESPAWN labels")
 			end
 		end)
 		table.insert(env.AutoBuyerConnections, connection)
@@ -796,8 +797,77 @@ local function nearestPromptTo(pos, radius)
 	return best
 end
 
--- kind = "oil" or "airdrop"
+-- ==========================================
+-- FALLEN BARREL SEARCH (NEW)
+-- A barrel that was picked up / dropped / left behind shows a floating label
+-- "DESPAWN: 595" (the timer counts down from about 600). Other loot on the map also has
+-- "DESPAWN: 30" labels, so only timers >= DESPAWN_MIN_SECONDS count as the barrel.
+-- If we know where the barrel was last seen, the closest label to that spot wins.
+-- ==========================================
+local function findDespawnTargets()
+	local found, seen = {}, {}
+	local char = player.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	local refPos = barrelRecoveryTargetPos
+
+	local function check(obj)
+		if not (obj:IsA("BillboardGui") or obj:IsA("SurfaceGui")) then return end
+		if obj:IsDescendantOf(screenGui) then return end
+
+		local text = ""
+		for _, c in ipairs(obj:GetDescendants()) do
+			if c:IsA("TextLabel") or c:IsA("TextButton") then
+				local raw = c.ContentText
+				if not raw or raw == "" then raw = c.Text end
+				if raw ~= "" then text = text .. string.gsub(raw, "\n", " ") .. " " end
+			end
+		end
+
+		local lower = string.lower(text)
+		local secs = tonumber(string.match(lower, "despawn%s*:?%s*(%d+)"))
+		if not secs or secs < DESPAWN_MIN_SECONDS then return end   -- not the barrel (e.g. DESPAWN: 30)
+
+		local part = resolveGuiPart(obj)
+		if not part or not part.Parent or seen[part] then return end
+		if char and part:IsDescendantOf(char) then return end        -- that one is on us, not fallen
+		seen[part] = true
+
+		table.insert(found, {
+			part = part,
+			prompt = findPromptFor(part),
+			despawn = secs,
+			dist = root and (part.Position - root.Position).Magnitude or math.huge,
+			refDist = refPos and (part.Position - refPos).Magnitude or nil,
+			text = text,
+		})
+	end
+
+	local n = 0
+	for _, obj in pairs(workspace:GetDescendants()) do
+		check(obj)
+		n = n + 1
+		if n % 3000 == 0 then task.wait() end
+	end
+	for _, obj in pairs(playerGui:GetDescendants()) do check(obj) end
+
+	table.sort(found, function(x, y)
+		if x.refDist and y.refDist then return x.refDist < y.refDist end
+		return x.dist < y.dist
+	end)
+	return found
+end
+
+-- kind = "oil", "airdrop" or "despawn" (fallen barrel, found through its DESPAWN label)
 local function findFloatingTargets(kind)
+	if kind == "despawn" then
+		local list = findDespawnTargets()
+		if #list == 0 then
+			-- old way as a backup: the "Oil ... studs" label (only exists while the barrel is not picked up)
+			list = findFloatingTargets("oil")
+		end
+		return list
+	end
+
 	local found, seen = {}, {}
 	local char = player.Character
 	local root = char and char:FindFirstChild("HumanoidRootPart")
@@ -1027,7 +1097,7 @@ local function visitTarget(label, kind, allowBarrelRecovery)
 	until #found > 0 or os.clock() > deadline or not running
 
 	if #found == 0 then
-		dbg(label, "NOT FOUND (no floating '" .. kind .. " ... studs' label)")
+		dbg(label, "NOT FOUND (no floating '" .. kind .. "' label)")
 		setStatus(label .. " not found")
 		task.wait(1)
 		return nil
@@ -1036,7 +1106,7 @@ local function visitTarget(label, kind, allowBarrelRecovery)
 	dbg(label, "labels found:", #found)
 	for i = 1, math.min(3, #found) do
 		local f = found[i]
-		dbg(("  #%d prompt=%s label=%s dist=%d  %s"):format(i, tostring(f.prompt ~= nil), tostring(f.labelDist), f.dist == math.huge and -1 or f.dist, f.part:GetFullName()))
+		dbg(("  #%d prompt=%s label=%s despawn=%s dist=%d  %s"):format(i, tostring(f.prompt ~= nil), tostring(f.labelDist), tostring(f.despawn), f.dist == math.huge and -1 or f.dist, f.part:GetFullName()))
 	end
 
 	local target = found[1]
@@ -1070,7 +1140,7 @@ local function visitTarget(label, kind, allowBarrelRecovery)
 	holdE(HOLD_TIME, prompt)
 
 	-- Remember the barrel: after pickup its floating label changes, so the scan can not find it anymore.
-	if kind == "oil" then
+	if kind == "oil" or kind == "despawn" then
 		local trackedObject = trackObjFor(prompt, target.part)
 		trackedBarrel = { obj = trackedObject, targetPart = target.part }
 		dbg("Tracking barrel object:", trackedObject:GetFullName())
@@ -1082,7 +1152,7 @@ local function visitTarget(label, kind, allowBarrelRecovery)
 			barrelRecoveryTargetPart = target.part
 			barrelRecoveryTargetPos = target.part.Parent and target.part.Position or nil
 			trackedBarrel = nil
-			setStatus("Died during pickup; scanning for dropped Oil UI...")
+			setStatus("Died during pickup; scanning for the fallen barrel...")
 		end
 	end
 
@@ -1173,10 +1243,10 @@ local function findExchange(refPos)
 					local part = resolveGuiPart(obj)
 					if hasPrice then
 						-- Exclude this purchase pad even if its prompt/model name also says "Oil Exchange".
-					if part then priceBearingExchangePads[part] = true end
+						if part then priceBearingExchangePads[part] = true end
 					else
-					add(part, nil, false)
-				end
+						add(part, nil, false)
+					end
 				end
 
 			elseif obj:IsA("ProximityPrompt") then
@@ -1260,7 +1330,7 @@ local function findExchange(refPos)
 								prompt = findPromptFor(part),
 								owned = belongsToMe(part),
 								buyPad = false,
-							dist = worldDistance,
+								dist = worldDistance,
 								labelDist = labelDistance,
 								resourceFallback = true,
 							}
@@ -1288,7 +1358,7 @@ local function isBarrelDropped()
 	return (objPosition(b.obj) - root.Position).Magnitude > 15
 end
 
--- if the barrel was dropped on the way: fly back to it and pick it up again
+-- if the barrel was dropped on the way: go back to it and pick it up again
 local function recoverBarrel()
 	for _ = 1, 3 do
 		if not running or not isBarrelDropped() then return end
@@ -1418,12 +1488,13 @@ local function visitExchange()
 	end
 end
 
+-- Is the fallen barrel's DESPAWN label (or, as a backup, its Oil label) still on the map?
 local function barrelRecoveryLabelStillVisible()
-	local oilTargets = findFloatingTargets("oil")
+	local targets = findFloatingTargets("despawn")
 	if not barrelRecoveryTargetPos then
-		return #oilTargets > 0
+		return #targets > 0
 	end
-	for _, target in ipairs(oilTargets) do
+	for _, target in ipairs(targets) do
 		if (target.part.Position - barrelRecoveryTargetPos).Magnitude <= 25 then
 			return true
 		end
@@ -1438,7 +1509,7 @@ local function clearBarrelRecovery()
 	barrelRecoveryTargetPos = nil
 end
 
--- After death, locate the dropped barrel from its floating "Oil ... studs" UI,
+-- After death, locate the fallen barrel from its floating "DESPAWN: ~595" label,
 -- pick it up again, then exchange it before allowing any other target.
 local function recoverDroppedBarrelFromUI()
 	if not barrelRecoveryPending then return true end
@@ -1457,11 +1528,12 @@ local function recoverDroppedBarrelFromUI()
 		end
 	end
 
-	local oilTargets = findFloatingTargets("oil")
+	-- NEW: search by the DESPAWN label (nearest to where the barrel was last seen)
+	local targets = findFloatingTargets("despawn")
 	local target = nil
 	if barrelRecoveryTargetPos then
 		local bestDistance = math.huge
-		for _, candidate in ipairs(oilTargets) do
+		for _, candidate in ipairs(targets) do
 			local distance = (candidate.part.Position - barrelRecoveryTargetPos).Magnitude
 			if distance < bestDistance then
 				target, bestDistance = candidate, distance
@@ -1469,42 +1541,42 @@ local function recoverDroppedBarrelFromUI()
 		end
 		if bestDistance > 25 then target = nil end
 	end
-	-- If the old part moved when it dropped, fall back to the nearest Oil UI target.
-	if not target and #oilTargets > 0 then target = oilTargets[1] end
+	-- If the barrel moved when it dropped, fall back to the best DESPAWN label (list is already sorted).
+	if not target and #targets > 0 then target = targets[1] end
 
 	if not target then
 		if barrelRecoveryAttempted and not barrelRecoveryLabelStillVisible() then
 			clearBarrelRecovery()
-			setStatus("Dropped barrel no longer appears in the UI")
+			setStatus("Fallen barrel no longer on the map")
 			return true
 		end
-		setStatus("Scanning UI for dropped barrel...")
+		setStatus("Scanning for the fallen barrel (DESPAWN label)...")
 		return false
 	end
 
 	barrelRecoveryTargetPart = target.part
 	barrelRecoveryTargetPos = target.part.Position
 	trackedBarrel = nil
-	local recoveredPart = visitTarget("Recovering dropped barrel", "oil", true)
+	local recoveredPart = visitTarget("Fallen barrel", "despawn", true)
 	if not recoveredPart then return false end
 
 	barrelRecoveryTargetPart = recoveredPart
 	barrelRecoveryTargetPos = recoveredPart.Position
 	barrelRecoveryAttempted = true
 	if trackedBarrel or isBarrelCarried() then
-		setStatus("Dropped barrel found; exchanging...")
+		setStatus("Fallen barrel found; exchanging...")
 		if running then visitExchange() end
 	end
 	if trackedBarrel or isBarrelCarried() then return false end
 
 	if barrelRecoveryLabelStillVisible() then
 		trackedBarrel = nil
-		setStatus("Dropped barrel still visible; rescanning...")
+		setStatus("Fallen barrel still visible; rescanning...")
 		return false
 	end
 
 	clearBarrelRecovery()
-	setStatus("Dropped barrel recovered and exchanged")
+	setStatus("Fallen barrel recovered and exchanged")
 	return true
 end
 
