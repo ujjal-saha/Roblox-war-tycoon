@@ -24,6 +24,13 @@ local MAX_REBIRTH = 12        -- the player can never enter more than this
 local REBIRTH_CONFIRM_MIN_CASH = 500000 -- screenshot rebirth confirmation cost; the dialog cost is also read dynamically
 local REBIRTH_CONFIRM_TIMEOUT = 8 -- seconds to wait for the confirmation dialog
 local REBIRTH_SKIP_TIME = 30  -- if a rebirth button does not work, wait this many seconds before trying it again
+local DISABLE_GUN_SCRIPT = true   -- while ON, switch off the game's gun script (ACS_Client). It is the one spamming
+                                  -- "FireGun ... attempt to index nil with 'Name'". Turned back on when you press OFF.
+local SCAN_CACHE_SECONDS = 10     -- reuse the last scan for this long instead of scanning the whole map every loop
+local REBIRTH_CHECK_INTERVAL = 5  -- seconds between rebirth button scans (keeps the game smooth)
+local CRATE_HOLD_TIME = 1.6       -- seconds to hold E on a Part Crate ("Pick Up" prompt needs 1.0)
+local CRATE_CHECK_INTERVAL = 3    -- seconds between looks at the PartCrate folder
+local PART_CRATE_CASH_LIMIT = 500000 -- only pursue Part Crates while readable cash is below this
 local DESPAWN_MIN_SECONDS = 100 -- a fallen barrel shows "DESPAWN: ~600"; other loot shows "DESPAWN: 30" and is ignored
 
 local function dbg(...)
@@ -56,7 +63,7 @@ screenGui.ResetOnSpawn = false
 screenGui.Parent = playerGui
 
 local mainFrame = Instance.new("Frame")
-mainFrame.Size = UDim2.new(0, 240, 0, 250)
+mainFrame.Size = UDim2.new(0, 240, 0, 276)
 mainFrame.Position = UDim2.new(1, -260, 0, 20)
 mainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
 mainFrame.BorderSizePixel = 2
@@ -68,10 +75,22 @@ local topBar = Instance.new("TextLabel")
 topBar.Size = UDim2.new(1, 0, 0, 30)
 topBar.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
 topBar.TextColor3 = Color3.fromRGB(200, 200, 200)
-topBar.Text = "≡ Auto Buyer (drag) ≡"
+topBar.Text = "≡ Auto Buyer ≡"
 topBar.Font = Enum.Font.SourceSansBold
 topBar.TextSize = 16
 topBar.Parent = mainFrame
+
+-- If the script stored the wrong collector, press this: it forgets it and uses the next one found.
+local nextCollectorButton = Instance.new("TextButton")
+nextCollectorButton.Size = UDim2.new(0, 84, 0, 22)
+nextCollectorButton.Position = UDim2.new(1, -88, 0, 4)
+nextCollectorButton.BackgroundColor3 = Color3.fromRGB(120, 90, 30)
+nextCollectorButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+nextCollectorButton.TextScaled = true
+nextCollectorButton.Font = Enum.Font.SourceSansBold
+nextCollectorButton.Text = "Next collector"
+nextCollectorButton.ZIndex = 2
+nextCollectorButton.Parent = mainFrame
 
 local toggleButton = Instance.new("TextButton")
 toggleButton.Size = UDim2.new(1, -20, 0, 45)
@@ -153,6 +172,19 @@ local completionFillCorner = Instance.new("UICorner")
 completionFillCorner.CornerRadius = UDim.new(1, 0)
 completionFillCorner.Parent = completionBarFill
 
+-- shows what the script sees in the PartCrate folder (ready/total per crate type, and why one is skipped)
+local crateLabel = Instance.new("TextLabel")
+crateLabel.Name = "CrateLabel"
+crateLabel.Size = UDim2.new(1, -20, 0, 22)
+crateLabel.Position = UDim2.new(0, 10, 0, 244)
+crateLabel.BackgroundTransparency = 1
+crateLabel.TextColor3 = Color3.fromRGB(255, 210, 120)
+crateLabel.Text = "Crates: waiting..."
+crateLabel.TextXAlignment = Enum.TextXAlignment.Left
+crateLabel.TextScaled = true
+crateLabel.Font = Enum.Font.SourceSansBold
+crateLabel.Parent = mainFrame
+
 local completionPercent = nil
 local completionEArmed = true
 local completionEPressing = false
@@ -219,6 +251,15 @@ local function parsePrice(text)
 	end
 	if string.find(lower, "free") then return 0 end
 	return nil
+end
+
+local function shortNum(n)
+	if not n then return "?" end
+	if n >= 1e12 then return string.format("%.2ft", n / 1e12) end
+	if n >= 1e9 then return string.format("%.2fb", n / 1e9) end
+	if n >= 1e6 then return string.format("%.2fm", n / 1e6) end
+	if n >= 1e3 then return string.format("%.1fk", n / 1e3) end
+	return tostring(math.floor(n))
 end
 
 -- true only if the text is really shown on screen (hidden labels are ignored)
@@ -344,12 +385,33 @@ local function readCompletionPercent()
 end
 
 local lastCollectorPos = nil   -- set by the scanner, used to know which rebirth buttons are near your base
-local lockedCollectorPart = nil -- FIX: once a Cash Collector is chosen we stick to it (no more flipping to the 2nd one)
+-- CASH COLLECTOR MEMORY: the first collector we collect from is stored (its position) and used from then on.
+-- If its label is not loaded one day, we simply go to the stored position instead of picking another collector.
+local storedCollectorPos = nil
+if env.AutoBuyerStoredCollector and env.AutoBuyerStoredCollectorJob == game.JobId then
+	storedCollectorPos = env.AutoBuyerStoredCollector   -- same server as last time: reuse it
+end
+local collectorPickIndex = 1   -- 1 = the first collector the scan finds (the "Next collector" button moves this on)
+local scanCache = nil          -- { time, collector, buttons } reused for SCAN_CACHE_SECONDS
+
+local function storeCollectorPos(pos)
+	storedCollectorPos = pos
+	env.AutoBuyerStoredCollector = pos
+	env.AutoBuyerStoredCollectorJob = game.JobId
+end
 local trackedBarrel = nil      -- tracked oil barrel; declared here so all movement helpers can check it
 local barrelRecoveryPending = false
 local barrelRecoveryTargetPart = nil
 local barrelRecoveryTargetPos = nil
 local barrelRecoveryAttempted = false
+
+-- Part Crates are named Air_<number>, Land_<number>, Naval_<number>
+local function isPartCrateName(name)
+	local n = string.lower(name or "")
+	return string.match(n, "^air_%d+") ~= nil
+		or string.match(n, "^land_%d+") ~= nil
+		or string.match(n, "^naval_%d+") ~= nil
+end
 
 local function isBarrelCarried()
 	local char = player.Character
@@ -399,7 +461,7 @@ local function isBarrelCarried()
 	for _, item in ipairs(char:GetChildren()) do
 		if item:IsA("Tool") or item:IsA("Model") then
 			local name = string.lower(item.Name)
-			if string.find(name, "barrel", 1, true) or string.find(name, "oil", 1, true) then
+			if string.find(name, "barrel", 1, true) or string.find(name, "oil", 1, true) or isPartCrateName(item.Name) then
 				return true
 			end
 		end
@@ -598,28 +660,31 @@ local function scan()
 		if not obj:IsDescendantOf(screenGui) then checkGuiObject(obj) end
 	end
 
-	-- FIX: pick the collector. Keep the locked one if it still exists, else lock the one closest to the player.
-	if lockedCollectorPart and lockedCollectorPart.Parent then
-		for _, c in ipairs(collectorCands) do
-			if c.part == lockedCollectorPart then collector = c break end
-		end
-	end
-	if not collector and #collectorCands > 0 then
-		local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+	-- Which collector?
+	--   1) a stored position exists  -> the collector at that position (never any other one)
+	--   2) nothing stored yet        -> the first one the scan finds (it gets stored when we collect)
+	if storedCollectorPos then
 		local bestD
 		for _, c in ipairs(collectorCands) do
-			local d = root and (c.part.Position - root.Position).Magnitude or 0
-			if not bestD or d < bestD then collector, bestD = c, d end
+			local d = (c.part.Position - storedCollectorPos).Magnitude
+			if d <= 20 and (not bestD or d < bestD) then collector, bestD = c, d end
 		end
-		if collector then
-			lockedCollectorPart = collector.part
-			dbg("Locked collector:", collector.part:GetFullName())
-		end
+	elseif #collectorCands > 0 then
+		collector = collectorCands[((collectorPickIndex - 1) % #collectorCands) + 1]
 	end
 	if collector then lastCollectorPos = collector.part.Position end
+	if not collector and storedCollectorPos then lastCollectorPos = storedCollectorPos end
 
 	return collector, buttons
 end
+
+table.insert(env.AutoBuyerConnections, nextCollectorButton.MouseButton1Click:Connect(function()
+	storedCollectorPos = nil
+	env.AutoBuyerStoredCollector = nil
+	collectorPickIndex = collectorPickIndex + 1
+	scanCache = nil
+	setStatus("Collector forgotten; using the next one found")
+end))
 
 -- ==========================================
 -- TELEPORT
@@ -636,11 +701,30 @@ local function teleportTo(part, isCollector)
 	if not (rootPart and part and part.Parent) then return false end
 
 	local offset = CFrame.new(0, 2.5, 0)
-	if isCollector then offset = CFrame.new(0, 2.5, 4) end
+	if isCollector then offset = CFrame.new(2, 2.5, 0) end
 
 	rootPart.Anchored = true
 	char:PivotTo(part.CFrame * offset)
 	task.wait(0.3)
+	rootPart.Anchored = false
+	return true
+end
+
+-- go to a stored collector position (used when the collector's label is not loaded right now)
+local function teleportToPosition(pos)
+	if barrelRecoveryPending or isBarrelCarried() or trackedBarrel then
+		setStatus("Barrel pending recovery/exchange; blocking teleport")
+		return false
+	end
+
+	local char = player.Character
+	local rootPart = char and char:FindFirstChild("HumanoidRootPart")
+	if not rootPart then return false end
+
+	pcall(function() player:RequestStreamAroundAsync(pos) end)
+	rootPart.Anchored = true
+	char:PivotTo(CFrame.new(pos + Vector3.new(2, 2.5, 0)))
+	task.wait(0.4)
 	rootPart.Anchored = false
 	return true
 end
@@ -656,7 +740,7 @@ local VirtualInputManager = game:GetService("VirtualInputManager")
 local RunService = game:GetService("RunService")
 local HOLD_TIME = 3          -- seconds to hold E
 local SEARCH_TIMEOUT = 10    -- seconds to keep searching for the barrel / airdrop
-local FLY_SPEED = 40         -- FIX: was 100. Slower = the game is less likely to reset you (and the barrel)
+local FLY_SPEED = 60         -- FIX: was 100. Slower = the game is less likely to reset you (and the barrel)
 local RECENT_WINDOW = 90     -- an object counts as "new" if it appeared in the last 90 s
 local airdropPending = false
 local handlingAirdrop = false
@@ -682,6 +766,17 @@ table.insert(env.AutoBuyerConnections, testButton.MouseButton1Click:Connect(func
 	end
 end))
 
+-- The real labels read "Oil 6.14k studs" / "Airdrop 3.92k studs" (lowercase "studs").
+-- Player name tags read "Mukboe 11 STUDS" (capitals), so they are ignored. Before this, a
+-- player whose name contained "oil" could send the script flying to them.
+local function classifyStudsLabel(text)
+	if not string.find(text, "studs", 1, true) then return nil end   -- case-sensitive on purpose
+	local lower = " " .. string.lower(text) .. " "
+	if string.find(lower, "%f[%a]airdrop%f[%A]") then return "airdrop" end
+	if string.find(lower, "%f[%a]oil%f[%A]") then return "oil" end
+	return nil
+end
+
 -- true if a REAL "Oil ... studs" or "Airdrop ... studs" floating label exists right now.
 -- It works through the objects in small chunks and pauses between them, so it never freezes the game.
 local function realTargetExists()
@@ -697,9 +792,7 @@ local function realTargetExists()
 						text = text .. raw .. " "
 					end
 				end
-				local lower = string.lower(text)
-				if string.find(lower, "studs", 1, true)
-					and (string.find(lower, "airdrop", 1, true) or string.find(lower, "oil", 1, true)) then
+				if classifyStudsLabel(text) then
 					return true
 				end
 			end
@@ -757,12 +850,48 @@ local function promptPosition(prompt)
 	return nil
 end
 
+-- all hold-E prompts close to a position. Uses a fast spatial search instead of walking the whole map.
+local function promptsNear(pos, radius)
+	local list, seenPrompt = {}, {}
+	local ok, parts = pcall(function() return workspace:GetPartBoundsInRadius(pos, radius) end)
+	if ok and parts then
+		for _, p in ipairs(parts) do
+			for _, d in ipairs(p:GetDescendants()) do
+				if d:IsA("ProximityPrompt") and not seenPrompt[d] then
+					seenPrompt[d] = true
+					table.insert(list, d)
+				end
+			end
+			local par = p.Parent
+			if par and par:IsA("Model") then
+				for _, d in ipairs(par:GetChildren()) do
+					if d:IsA("ProximityPrompt") and not seenPrompt[d] then
+						seenPrompt[d] = true
+						table.insert(list, d)
+					end
+				end
+			end
+		end
+	end
+	return list
+end
+
 -- the E prompt (hold E) that belongs to the thing the label is attached to
 local function findPromptFor(part)
+	local best, bestD
+	for _, d in ipairs(promptsNear(part.Position, 40)) do
+		local pp = promptPosition(d)
+		if pp then
+			local dist = (pp - part.Position).Magnitude
+			if dist <= 40 and (not bestD or dist < bestD) then best, bestD = d, dist end
+		end
+	end
+	if best then return best end
+
+	-- backup (rare): look inside the part's own parents
 	local cur = part
-	for _ = 1, 3 do
+	for _ = 1, 2 do
 		if not cur or cur == workspace then break end
-		local best, bestD
 		for _, d in pairs(cur:GetDescendants()) do
 			if d:IsA("ProximityPrompt") then
 				local pp = promptPosition(d)
@@ -783,7 +912,8 @@ end
 local function nearestPromptTo(pos, radius)
 	local char = player.Character
 	local best, bestD
-	for _, obj in pairs(workspace:GetDescendants()) do
+
+	local function consider(obj)
 		if obj:IsA("ProximityPrompt") and obj.Enabled
 			and not (char and obj:IsDescendantOf(char))
 			and not (trackedBarrel and trackedBarrel.obj and obj:IsDescendantOf(trackedBarrel.obj)) then
@@ -794,6 +924,12 @@ local function nearestPromptTo(pos, radius)
 			end
 		end
 	end
+
+	for _, obj in ipairs(promptsNear(pos, radius)) do consider(obj) end
+	if best then return best end
+
+	-- backup (rare): the slow full search, only when the fast one found nothing
+	for _, obj in pairs(workspace:GetDescendants()) do consider(obj) end
 	return best
 end
 
@@ -886,15 +1022,7 @@ local function findFloatingTargets(kind)
 		end
 
 		local lower = string.lower(text)
-		if not string.find(lower, "studs", 1, true) then return end
-		local thisKind
-		if string.find(lower, "airdrop", 1, true) then
-			thisKind = "airdrop"
-		elseif string.find(lower, "oil", 1, true) then
-			thisKind = "oil"
-		else
-			return
-		end
+		local thisKind = classifyStudsLabel(text)
 		if thisKind ~= kind then return end
 
 		local part = resolveGuiPart(obj)
@@ -1171,6 +1299,59 @@ local function belongsToMe(part)
 	return false
 end
 
+-- THE REAL OIL EXCHANGER (found with the E recorder):
+--   Workspace.Tycoon.Tycoons.<your tycoon>.Essentials.Oil Collector.Persistant.CratePromptPart.DepositPrompt
+--   (hold 1s, text "Sell Item")
+-- The tycoon name is different for every player ("Lima" was yours), so we look in every tycoon and
+-- take yours: the one that belongs to you, otherwise the one closest to your base.
+local function findOilCollectorDeposit(refPos)
+	local cands = {}
+
+	local function consider(prompt)
+		if prompt:IsA("ProximityPrompt") and prompt.Name == "DepositPrompt" then
+			local par = prompt.Parent
+			if par and par:IsA("Attachment") then par = par.Parent end
+			if par and par:IsA("BasePart") then
+				table.insert(cands, {
+					part = par,
+					prompt = prompt,
+					owned = belongsToMe(par),
+					buyPad = false,
+					dist = (par.Position - refPos).Magnitude,
+				})
+			end
+		end
+	end
+
+	local tycoonRoot = workspace:FindFirstChild("Tycoon")
+	local tycoons = tycoonRoot and tycoonRoot:FindFirstChild("Tycoons")
+	if tycoons then
+		for _, tycoon in ipairs(tycoons:GetChildren()) do
+			local essentials = tycoon:FindFirstChild("Essentials")
+			local oilCollector = essentials and essentials:FindFirstChild("Oil Collector")
+			if oilCollector then
+				for _, d in ipairs(oilCollector:GetDescendants()) do consider(d) end
+			end
+		end
+	end
+
+	if #cands == 0 then
+		-- not under that exact path: any DepositPrompt inside something called "Oil Collector"
+		local n = 0
+		for _, d in ipairs(workspace:GetDescendants()) do
+			if d.Name == "DepositPrompt" and d:FindFirstAncestor("Oil Collector") then consider(d) end
+			n = n + 1
+			if n % 3000 == 0 then task.wait() end
+		end
+	end
+
+	table.sort(cands, function(x, y)
+		if x.owned ~= y.owned then return x.owned end
+		return x.dist < y.dist
+	end)
+	return cands[1]
+end
+
 -- Finds the Oil Exchange in your base. It tries several ways, since the reference text
 -- "$100,000 PARTS $100,000 OIL EXCHANGE" is a price-bearing purchase label, not the target:
 --   1) a non-price floating/surface label containing both "oil" and "exchange"
@@ -1179,6 +1360,8 @@ end
 --   4) if no exchanger candidate exists, the floating "Resource Collection ... studs" UI
 -- Best pick: has an E prompt > is in your tycoon > is not a buy pad > closest to you.
 local function findExchange(refPos)
+	-- ORDER: 1) the Oil Exchange text / prompt / name  2) the Oil Collector DepositPrompt ("Sell Item")
+	--        3) the "Resource Collection" marker
 	local cands, seen = {}, {}
 	local priceBearingExchangePads = {}
 
@@ -1293,7 +1476,11 @@ local function findExchange(refPos)
 	end)
 	if good[1] then return good[1] end
 
-	-- Fallback: if no physical Oil Exchange candidate is available, use the
+	-- Fallback 1: the Oil Exchange text was not found -> use the Oil Collector's DepositPrompt ("Sell Item")
+	local deposit = findOilCollectorDeposit(refPos)
+	if deposit then return deposit end
+
+	-- Fallback 2: if no physical Oil Exchange candidate is available, use the
 	-- floating "Resource Collection ... studs" marker shown in the reference image.
 	local fallback, fallbackDistance
 	local fallbackSeen = {}
@@ -1413,8 +1600,8 @@ local function visitExchange()
 	-- the base is streamed in; then search for the physical Oil Exchange nearby.
 	local barrelPending = barrelRecoveryPending or trackedBarrel ~= nil or isBarrelCarried()
 	if barrelPending then
-		if lockedCollectorPart and lockedCollectorPart.Parent then
-			lastCollectorPos = lockedCollectorPart.Position
+		if storedCollectorPos then
+			lastCollectorPos = storedCollectorPos
 		end
 		if not lastCollectorPos then
 			pcall(scan)
@@ -1580,6 +1767,137 @@ local function recoverDroppedBarrelFromUI()
 	return true
 end
 
+-- ==========================================
+-- PART CRATES
+-- Air_<number>, Land_<number>, Naval_<number> crates under
+-- Workspace.Game Systems.Collectibles Workspace.PartCrate  (prompt "Pick Up", hold 1s).
+-- Each one is picked up and sold at the Oil Collector, one at a time.
+-- ==========================================
+local crateFail = {}        -- crate name -> { count, untilTime }
+local lastCrateCheck = 0
+
+local function partCrateFolder()
+	local gameSystems = workspace:FindFirstChild("Game Systems")
+	local collectibles = gameSystems and gameSystems:FindFirstChild("Collectibles Workspace")
+	return collectibles and collectibles:FindFirstChild("PartCrate")
+end
+
+-- every crate that can be picked up right now, nearest first.
+-- It also writes a readout to the GUI: "Air 1/1 | Land 1/1 | Naval 0/1 (prompt off)"
+-- (ready / total in the folder, and the reason when some are not ready).
+local function findPartCrates()
+	local list = {}
+	local folder = partCrateFolder()
+	if not folder then
+		crateLabel.Text = "Crates: PartCrate folder not found"
+		return list, nil
+	end
+
+	local char = player.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+
+	local stats, order = {}, {}
+	for _, crate in ipairs(folder:GetChildren()) do
+		local kind = string.match(crate.Name, "^(%a+)_") or "?"
+		local st = stats[kind]
+		if not st then
+			st = { total = 0, ready = 0, note = nil }
+			stats[kind] = st
+			table.insert(order, kind)
+		end
+		st.total = st.total + 1
+
+		local prompt = crate:IsA("ProximityPrompt") and crate or crate:FindFirstChildWhichIsA("ProximityPrompt", true)
+		if not prompt then
+			st.note = "no prompt"
+		elseif not prompt.Enabled then
+			st.note = "prompt off"
+		else
+			local failure = crateFail[crate.Name]
+			if failure and failure.untilTime and os.clock() < failure.untilTime then
+				st.note = "skipped 60s"
+			else
+				local pos = promptPosition(prompt)
+				if not pos and crate:IsA("Model") then pos = crate:GetPivot().Position end
+				if not pos and crate:IsA("BasePart") then pos = crate.Position end
+				if pos then
+					st.ready = st.ready + 1
+					table.insert(list, {
+						crate = crate,
+						prompt = prompt,
+						pos = pos,
+						dist = root and (pos - root.Position).Magnitude or 0,
+					})
+				else
+					st.note = "no position"
+				end
+			end
+		end
+	end
+
+	table.sort(order)
+	local pieces = {}
+	for _, kind in ipairs(order) do
+		local st = stats[kind]
+		table.insert(pieces, ("%s %d/%d%s"):format(kind, st.ready, st.total, st.note and (" (" .. st.note .. ")") or ""))
+	end
+	crateLabel.Text = (#pieces > 0) and ("Crates: " .. table.concat(pieces, " | ")) or "Crates: none right now"
+
+	table.sort(list, function(a, b) return a.dist < b.dist end)
+	return list, folder
+end
+
+-- teleport to the crate, hold E, and check that it really came off the ground
+local function collectPartCrate(item, folder)
+	setStatus("Part crate: " .. item.crate.Name)
+	if not tpToPos(item.pos, item.crate.Name) then return false end
+	if not running then return false end
+	task.wait(0.8)
+
+	for _ = 1, 2 do
+		if not running then return false end
+		if not item.crate.Parent then break end   -- already gone
+
+		holdE(CRATE_HOLD_TIME, item.prompt)
+		task.wait(0.5)
+
+		-- picked up = it is no longer lying in the PartCrate folder (or its prompt switched off)
+		if item.crate.Parent ~= folder or not item.prompt.Enabled then
+			trackedBarrel = { obj = item.crate, targetPart = item.prompt.Parent }
+			dbg("Picked up part crate:", item.crate.Name)
+			return true
+		end
+	end
+	return false
+end
+
+-- returns true if it did something (so the main loop starts over)
+local function handlePartCrates()
+	local list, folder = findPartCrates()
+	if #list == 0 then return false end
+
+	handlingAirdrop = true   -- blocks the airdrop auto-trigger while we work on crates
+	local item = list[1]
+	local picked = collectPartCrate(item, folder)
+
+	if picked and running then
+		setStatus("Crate picked up; selling it...")
+		visitExchange()
+	elseif not picked then
+		local failure = crateFail[item.crate.Name] or { count = 0 }
+		failure.count = failure.count + 1
+		if failure.count >= 3 then
+			failure.count = 0
+			failure.untilTime = os.clock() + 60   -- give up on this crate for a minute
+		end
+		crateFail[item.crate.Name] = failure
+		setStatus("Could not pick up " .. item.crate.Name)
+	end
+
+	handlingAirdrop = false
+	return true
+end
+
 local function handleAirdrop()
 	airdropPending = false
 	handlingAirdrop = true
@@ -1665,7 +1983,10 @@ local rebirthDone = {}    -- key -> true when the button was bought (it disappea
 local rebirthSkip = {}    -- key -> time until we try it again
 local rejectLogged = {}   -- so the console is not spammed with the same message
 
+local lastRebirthCheck = 0
+
 local function clearRebirthMemory()
+	lastRebirthCheck = 0
 	rebirthCache = {}
 	rebirthDone = {}
 	rebirthSkip = {}
@@ -1826,8 +2147,11 @@ end
 -- goes through every wanted rebirth button, lowest number first
 local function doRebirthButtons()
 	if rebirthLimit <= 0 then return end
+	if os.clock() - lastRebirthCheck < REBIRTH_CHECK_INTERVAL then return end
+	lastRebirthCheck = os.clock()
 
-	-- the "is it my base" check needs the collector position, scan once to get it
+	-- the "is it my base" check needs the collector position
+	if storedCollectorPos then lastCollectorPos = storedCollectorPos end
 	if not lastCollectorPos then pcall(scan) end
 
 	local loaded = findLoadedRebirths()
@@ -1953,13 +2277,43 @@ local function mainLoop()
 			end
 		end
 
+		-- Only Part Crates are cash-gated. Oil-barrel and airdrop handling above remains unchanged.
+		if not airdropPending and os.clock() - lastCrateCheck >= CRATE_CHECK_INTERVAL then
+			lastCrateCheck = os.clock()
+			local crateCash = getMoney()
+			if crateCash ~= nil and crateCash < PART_CRATE_CASH_LIMIT then
+				if handlePartCrates() then continue end
+			elseif crateCash ~= nil then
+				crateLabel.Text = ("Crates: paused at $%s (need below $%s)"):format(
+					shortNum(crateCash), shortNum(PART_CRATE_CASH_LIMIT))
+			else
+				crateLabel.Text = "Crates: paused (cash unreadable)"
+			end
+		end
+
 		-- 0. rebirth buttons FIRST (no money check)
 		doRebirthButtons()
 		if not stillRunning() then break end
 		if completionEPressing or airdropPending then continue end
 
-		setStatus("Scanning...")
-		local collector, buttons = scan()
+		local collector, buttons
+		if scanCache and os.clock() - scanCache.time < SCAN_CACHE_SECONDS
+			and (scanCache.collector.stored or (scanCache.collector.part and scanCache.collector.part.Parent)) then
+			collector, buttons = scanCache.collector, scanCache.buttons
+		else
+			setStatus("Scanning...")
+			collector, buttons = scan()
+			if not collector and storedCollectorPos then
+				-- the collector's label is not loaded right now: use the stored position instead
+				collector = { stored = true, pos = storedCollectorPos }
+				dbg("Collector label not found, using the stored position")
+			end
+			if collector then
+				scanCache = { time = os.clock(), collector = collector, buttons = buttons }
+			else
+				scanCache = nil
+			end
+		end
 
 		if not collector then
 			setStatus("No 'Cash to collect' found")
@@ -1969,8 +2323,18 @@ local function mainLoop()
 
 		-- 1. go to collector and collect
 		setStatus("Collecting cash...")
-		teleportTo(collector.part, true)
+		local arrived
+		if collector.stored then
+			arrived = teleportToPosition(collector.pos)
+		else
+			arrived = teleportTo(collector.part, true)
+		end
 		task.wait(COLLECT_WAIT)
+		-- first time: remember where the collector is, so we always come back to THIS one
+		if arrived and not storedCollectorPos and collector.part then
+			storeCollectorPos(collector.part.Position)
+			dbg("Stored the collector position:", tostring(collector.part.Position))
+		end
 		if not stillRunning() then break end
 		if completionEPressing or airdropPending then continue end
 
@@ -1994,8 +2358,8 @@ local function mainLoop()
 			for _, b in ipairs(buttons) do
 				if not cheapest or b.price < cheapest then cheapest = b.price end
 			end
-			setStatus(("Cash %s | %d buttons | cheapest %s"):format(tostring(money), #buttons, tostring(cheapest)))
-			task.wait(3)
+			setStatus(("Cash %s | cheapest %s"):format(shortNum(money), shortNum(cheapest)))
+			task.wait(5)
 			continue -- loop goes straight back to the collector
 		end
 
@@ -2030,6 +2394,8 @@ local function mainLoop()
 				task.wait(0.3)
 			end
 		end
+
+		scanCache = nil   -- we tried to buy things, so scan again next time
 
 		-- 5. loop restarts -> back to the rebirth buttons, then the collector
 	end
@@ -2135,8 +2501,20 @@ local function waitForRebirthConfirmation(timeout)
 	return nil, nil, nil
 end
 
-local function clickGuiButton(button)
+local function clickGuiButton(button, forceMouse)
 	if not (button and button.Parent and labelVisible(button, playerGui)) then return false end
+
+	-- best way: trigger the button directly. A real mouse click would ALSO click the game
+	-- behind it and make the gun fire (that is where the FireGun errors came from).
+	if firesignal and not forceMouse then
+		local any = false
+		for _, signalName in ipairs({ "MouseButton1Down", "MouseButton1Up", "MouseButton1Click", "Activated" }) do
+			local ok = pcall(function() firesignal(button[signalName]) end)
+			any = any or ok
+		end
+		if any then return true end
+	end
+
 	local center = button.AbsolutePosition + button.AbsoluteSize / 2
 	local downWorked = pcall(function()
 		VirtualInputManager:SendMouseButtonEvent(center.X, center.Y, 0, true, game, 0)
@@ -2213,6 +2591,8 @@ local function pressCompletionE()
 	end
 
 	local confirmed = false
+	local clickedAt = os.clock()
+	local usedMouse = false
 	local closeDeadline = os.clock() + REBIRTH_CONFIRM_TIMEOUT
 	repeat
 		task.wait(0.2)
@@ -2220,6 +2600,10 @@ local function pressCompletionE()
 		if not stillOpen then
 			confirmed = true
 			break
+		elseif not usedMouse and os.clock() - clickedAt > 1.5 then
+			-- the direct trigger did not close the dialog: use a real click as the backup
+			usedMouse = true
+			clickGuiButton(stillOpen, true)
 		end
 	until os.clock() >= closeDeadline
 
@@ -2268,6 +2652,37 @@ task.spawn(function()
 end)
 
 -- ==========================================
+-- GUN SCRIPT SILENCER
+-- The red "ACS_Client.FireModuleClient:349 attempt to index nil with 'Name'" lines come from the
+-- GAME's gun script, which keeps firing while the auto buyer moves you around / presses keys.
+-- Switching that one script off while the auto buyer is ON stops the spam for good.
+-- It is switched back on when you press OFF (the gun then works normally again).
+-- Set DISABLE_GUN_SCRIPT = false at the top if you want to keep the gun working while ON.
+-- ==========================================
+local function gunScript()
+	local char = player.Character
+	local s = char and char:FindFirstChild("ACS_Client")
+	if s and (s:IsA("LocalScript") or s:IsA("Script")) then return s end
+	return nil
+end
+
+local function setGunScriptEnabled(enabled)
+	if not DISABLE_GUN_SCRIPT then return end
+	local s = gunScript()
+	if s then pcall(function() s.Disabled = not enabled end) end
+end
+
+setGunScriptEnabled(true)   -- a previous run may have left it switched off
+
+-- after a respawn the game creates a fresh ACS_Client: keep it off while we are ON
+task.spawn(function()
+	while env.AutoBuyerRunId == myRunId do
+		task.wait(1)
+		if running then setGunScriptEnabled(false) end
+	end
+end)
+
+-- ==========================================
 -- TOGGLE
 -- ==========================================
 table.insert(env.AutoBuyerConnections, toggleButton.MouseButton1Click:Connect(function()
@@ -2279,12 +2694,15 @@ table.insert(env.AutoBuyerConnections, toggleButton.MouseButton1Click:Connect(fu
 		local n = tonumber(string.match(rebirthBox.Text, "%d+")) or 0
 		rebirthLimit = math.clamp(n, 0, MAX_REBIRTH)
 		clearRebirthMemory()
-		lockedCollectorPart = nil   -- re-pick the closest collector each time you switch ON
 		releaseMouse()   -- release any stuck mouse-down state; do not reparent the ACS weapon
+		setGunScriptEnabled(false)   -- stop the FireGun error spam
+		scanCache = nil
+		lastCrateCheck = 0
 		task.spawn(mainLoop)
 	else
 		toggleButton.Text = "OFF"
 		toggleButton.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+		setGunScriptEnabled(true)    -- gun works again
 		setStatus("Stopping...")
 	end
 end))
