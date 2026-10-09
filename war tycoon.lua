@@ -30,7 +30,9 @@ local SCAN_CACHE_SECONDS = 10     -- reuse the last scan for this long instead o
 local REBIRTH_CHECK_INTERVAL = 5  -- seconds between rebirth button scans (keeps the game smooth)
 local CRATE_HOLD_TIME = 1.6       -- seconds to hold E on a Part Crate ("Pick Up" prompt needs 1.0)
 local CRATE_CHECK_INTERVAL = 3    -- seconds between looks at the PartCrate folder
-local PART_CRATE_CASH_LIMIT = 500000 -- only pursue Part Crates while readable cash is below this
+local PART_CRATE_CASH_LIMIT = 500000 -- normal Part Crate target at/above 20% completion or if completion is unreadable
+local PART_CRATE_EARLY_CASH_TARGET = 50000 -- base target while completion is below 20%
+local PART_CRATE_EARLY_COMPLETION_LIMIT = 20
 local DESPAWN_MIN_SECONDS = 100 -- a fallen barrel shows "DESPAWN: ~600"; other loot shows "DESPAWN: 30" and is ignored
 
 local function dbg(...)
@@ -1847,6 +1849,52 @@ local function findPartCrates()
 	return list, folder
 end
 
+-- Early-game crate target: use at least $50k, or raise it to the cheapest visible
+-- unbought purchase price if that price is higher. At/above 20% (or if completion
+-- is unreadable), the normal $500k target is used.
+local function getPartCrateCashTarget()
+	if completionPercent == nil or completionPercent >= PART_CRATE_EARLY_COMPLETION_LIMIT then
+		return PART_CRATE_CASH_LIMIT
+	end
+
+	local target = PART_CRATE_EARLY_CASH_TARGET
+	local buttons = nil
+	local cache = scanCache
+	local cacheUsable = cache
+		and cache.collector
+		and cache.buttons
+		and os.clock() - cache.time < SCAN_CACHE_SECONDS
+		and (cache.collector.stored or (cache.collector.part and cache.collector.part.Parent))
+
+	if cacheUsable then
+		buttons = cache.buttons
+	else
+		local collector, scannedButtons = scan()
+		buttons = scannedButtons or {}
+		if not collector and storedCollectorPos then
+			collector = { stored = true, pos = storedCollectorPos }
+		end
+		if collector then
+			scanCache = { time = os.clock(), collector = collector, buttons = buttons }
+		else
+			scanCache = nil
+		end
+	end
+
+	local cheapestUnboughtPrice = nil
+	for _, button in ipairs(buttons or {}) do
+		if button.price and isAlive(button)
+			and (not cheapestUnboughtPrice or button.price < cheapestUnboughtPrice) then
+			cheapestUnboughtPrice = button.price
+		end
+	end
+
+	if cheapestUnboughtPrice and cheapestUnboughtPrice > target then
+		target = cheapestUnboughtPrice
+	end
+	return target
+end
+
 -- teleport to the crate, hold E, and check that it really came off the ground
 local function collectPartCrate(item, folder)
 	setStatus("Part crate: " .. item.crate.Name)
@@ -1902,12 +1950,8 @@ local function handleAirdrop()
 	airdropPending = false
 	handlingAirdrop = true
 
-	-- remember where the base is, we fly back here after collecting
-	local char = player.Character
-	local homeCFrame = char and char:GetPivot()
-	if lastCollectorPos then
-		homeCFrame = CFrame.new(lastCollectorPos + Vector3.new(0, 3, 4))   -- the base = next to your Cash Collector
-	end
+	-- The post-airdrop return uses a teleport to the remembered Cash Collector.
+	-- Barrel/crate delivery routes still use their existing flight path in visitExchange().
 
 	if barrelRecoveryPending and not recoverDroppedBarrelFromUI() then
 		setStatus("Waiting to recover dropped barrel before airdrop")
@@ -1962,13 +2006,34 @@ local function handleAirdrop()
 	if running then visitTarget("Airdrop", "airdrop") end
 	if running then recoverBarrel() end
 
-	-- fly back to the base, then to the Parts Oil Exchange and press E
-	if running and homeCFrame then
-		setStatus("Flying back to base...")
-		flyTo(homeCFrame, "base")
+	-- Return from the airdrop by teleporting to the remembered Cash Collector.
+	-- This does not add a cash check to airdrop or oil-barrel handling.
+	if running then
+		if barrelRecoveryPending or trackedBarrel or isBarrelCarried() then
+			-- Preserve delivery priority: only a pending barrel/crate uses the existing flight route.
+			setStatus("Barrel pending after airdrop; completing delivery...")
+			visitExchange()
+		else
+			local collectorPos = storedCollectorPos or lastCollectorPos
+			if not collectorPos then
+				pcall(scan)
+				collectorPos = storedCollectorPos or lastCollectorPos
+			end
+
+			if collectorPos then
+				setStatus("Teleporting back to Cash Collector...")
+				teleportToPosition(collectorPos)
+			else
+				setStatus("Cash Collector not remembered; skipping return teleport")
+			end
+		end
 	end
+
 	if running then recoverBarrel() end
-	if running then visitExchange() end
+	-- Retry the normal delivery route only if a barrel is still pending.
+	if running and (barrelRecoveryPending or trackedBarrel or isBarrelCarried()) then
+		visitExchange()
+	end
 
 	airdropPending = false
 	handlingAirdrop = false
@@ -2281,13 +2346,18 @@ local function mainLoop()
 		if not airdropPending and os.clock() - lastCrateCheck >= CRATE_CHECK_INTERVAL then
 			lastCrateCheck = os.clock()
 			local crateCash = getMoney()
-			if crateCash ~= nil and crateCash < PART_CRATE_CASH_LIMIT then
-				if handlePartCrates() then continue end
-			elseif crateCash ~= nil then
-				crateLabel.Text = ("Crates: paused at $%s (need below $%s)"):format(
-					shortNum(crateCash), shortNum(PART_CRATE_CASH_LIMIT))
-			else
+			if crateCash == nil then
 				crateLabel.Text = "Crates: paused (cash unreadable)"
+			else
+				local crateTarget = getPartCrateCashTarget()
+				if crateCash < crateTarget then
+					if handlePartCrates() then continue end
+				else
+					local progressText = completionPercent ~= nil
+						and (string.format("%g%%", completionPercent)) or "unknown"
+					crateLabel.Text = ("Crates: paused at $%s (target $%s; completion %s)"):format(
+						shortNum(crateCash), shortNum(crateTarget), progressText)
+				end
 			end
 		end
 
